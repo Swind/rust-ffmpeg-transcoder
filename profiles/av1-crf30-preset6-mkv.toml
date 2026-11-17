@@ -1,0 +1,11 @@
+decoder_threads = 2
+
+[video]
+encoder = "libsvtav1"
+crf = 30
+preset = 6
+logical_processors = 12
+
+[audio]
+mode = "copy_aac"
+streams = "first"

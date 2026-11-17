@@ -2,6 +2,7 @@ pub mod api;
 pub mod config;
 pub mod error;
 pub mod ffmpeg;
+pub mod profile;
 pub mod scheduler;
 pub mod session;
 pub mod stream;
@@ -14,7 +15,7 @@ use std::{error::Error, time::Duration};
 pub async fn run(config: Config) -> Result<(), Box<dyn Error>> {
     config.validate()?;
     let token = config.token()?;
-    let profiles = ffmpeg::profiles(&config).await;
+    let profiles = ffmpeg::profiles(&config).await?;
     for profile in &profiles {
         if let Some(reason) = &profile.reason {
             tracing::warn!(profile = %profile.id, %reason, "profile unavailable");

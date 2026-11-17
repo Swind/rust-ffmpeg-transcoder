@@ -15,6 +15,7 @@ RUN apt-get update \
 COPY --from=builder /build/target/release/transcoder-server /usr/local/bin/transcoder-server
 COPY --from=builder /build/target/release/transcoder-client /usr/local/bin/transcoder-client
 COPY config.example.toml /etc/transcoder/config.toml
+COPY profiles /etc/transcoder/profiles
 USER 10001:10001
 EXPOSE 8080
 STOPSIGNAL SIGTERM

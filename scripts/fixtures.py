@@ -40,6 +40,26 @@ def generate(directory, backpressure=True):
     return files
 
 
+def generate_profiles(directory):
+    """Short fractional-rate media with deliberately ordered AAC and MP3 tracks."""
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    audio = directory / "aac-first.mkv"
+    ffmpeg(audio, ["-f", "lavfi", "-i", "testsrc2=size=192x128:rate=24000/1001",
+                   "-f", "lavfi", "-i", "sine=frequency=997:sample_rate=48000",
+                   "-f", "lavfi", "-i", "sine=frequency=431:sample_rate=48000"],
+           ["-t", "1.25125", "-map", "0:v:0", "-map", "1:a:0", "-map", "2:a:0",
+            "-c:v", "libx264", "-threads", "2", "-preset", "ultrafast",
+            "-pix_fmt", "yuv420p", "-c:a:0", "aac", "-c:a:1", "libmp3lame",
+            "-f", "matroska"])
+    silent = directory / "no-audio.mkv"
+    ffmpeg(silent, ["-i", str(audio)], ["-map", "0:v:0", "-c", "copy", "-f", "matroska"])
+    mp3 = directory / "mp3-first.mkv"
+    ffmpeg(mp3, ["-i", str(audio)],
+           ["-map", "0:v:0", "-map", "0:a:1", "-map", "0:a:0", "-c", "copy", "-f", "matroska"])
+    return {"audio": audio, "silent": silent, "mp3": mp3}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("directory", type=Path)

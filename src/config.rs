@@ -1,5 +1,9 @@
 use serde::Deserialize;
-use std::{net::SocketAddr, path::Path, time::Duration};
+use std::{
+    net::SocketAddr,
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -104,11 +108,13 @@ impl Default for Ffmpeg {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Profiles {
+    pub directory: PathBuf,
     pub enabled: Vec<String>,
 }
 impl Default for Profiles {
     fn default() -> Self {
         Self {
+            directory: "profiles".into(),
             enabled: vec!["h264-cpu-mkv".into()],
         }
     }
@@ -116,11 +122,26 @@ impl Default for Profiles {
 
 impl Config {
     pub fn load(path: Option<&Path>) -> Result<Self, Box<dyn std::error::Error>> {
-        let config: Self = match path {
-            Some(path) => toml::from_str(&std::fs::read_to_string(path)?)?,
+        let mut config: Self = match path {
+            Some(path) => {
+                let source = std::fs::read_to_string(path)
+                    .map_err(|error| format!("config {}: {error}", path.display()))?;
+                toml::from_str(&source)
+                    .map_err(|error| format!("config {}: {error}", path.display()))?
+            }
             None => Self::default(),
         };
-        config.validate()?;
+        config.validate().map_err(|error| match path {
+            Some(path) => format!("config {}: {error}", path.display()),
+            None => error,
+        })?;
+        if config.profiles.directory.is_relative() {
+            let base = match path {
+                Some(path) => path.parent().unwrap_or_else(|| Path::new("")).to_path_buf(),
+                None => std::env::current_dir()?,
+            };
+            config.profiles.directory = base.join(&config.profiles.directory);
+        }
         Ok(config)
     }
 
@@ -159,15 +180,24 @@ impl Config {
         if self.ffmpeg.binary.is_empty() || self.security.token_env.is_empty() {
             return Err("ffmpeg binary and security token_env must not be empty".into());
         }
+        if self.profiles.directory.as_os_str().is_empty() {
+            return Err("profiles.directory must not be empty".into());
+        }
         if self.profiles.enabled.is_empty() {
             return Err("at least one profile must be enabled".into());
         }
         for (index, profile) in self.profiles.enabled.iter().enumerate() {
-            if !matches!(profile.as_str(), "h264-cpu-mkv" | "h264-vaapi-mkv") {
-                return Err(format!("unknown configured profile: {profile}"));
+            if !crate::profile::valid_id(profile) {
+                return Err(format!(
+                    "invalid profile ID {profile:?} in {}: use 1..64 lowercase ASCII letters, digits or hyphens, beginning with a letter or digit",
+                    self.profiles.directory.display()
+                ));
             }
             if self.profiles.enabled[..index].contains(profile) {
-                return Err(format!("duplicate configured profile: {profile}"));
+                return Err(format!(
+                    "duplicate configured profile {profile:?} in {}",
+                    self.profiles.directory.display()
+                ));
             }
         }
         Ok(())

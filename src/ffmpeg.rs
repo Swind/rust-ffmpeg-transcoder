@@ -1,70 +1,16 @@
-use crate::config::Config;
-use serde::Serialize;
-use std::{collections::VecDeque, os::unix::fs::FileTypeExt, process::Stdio, time::Duration};
+use crate::{
+    config::Config,
+    profile::{self, Profile},
+};
+use std::{
+    collections::VecDeque, ffi::OsStr, os::unix::fs::FileTypeExt, process::Stdio, time::Duration,
+};
 use tokio::{io::AsyncReadExt, process::Command};
 
-pub const CPU_PROFILE: &str = "h264-cpu-mkv";
-pub const VAAPI_PROFILE: &str = "h264-vaapi-mkv";
-
-#[derive(Clone, Debug, Serialize)]
-pub struct Profile {
-    pub id: String,
-    pub available: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub reason: Option<String>,
-}
-
-pub fn arguments(profile: &str, device: &str) -> Vec<String> {
-    let mut args = vec![
-        "-hide_banner",
-        "-nostdin",
-        "-loglevel",
-        "warning",
-        "-nostats",
-        "-filter_threads",
-        "1",
-    ];
-    if profile == VAAPI_PROFILE {
-        args.extend(["-vaapi_device", device]);
-    }
-    // Demuxers can otherwise open URLs or local files referenced by hostile media.
-    // Only stdin/stdout pipes are allowed, including nested demuxer protocol opens.
-    args.extend([
-        "-protocol_whitelist",
-        "pipe",
-        "-threads",
-        "2",
-        "-i",
-        "pipe:0",
-        "-map",
-        "0:v:0",
-        "-map",
-        "0:a?",
-    ]);
-    if profile == VAAPI_PROFILE {
-        args.extend([
-            "-vf",
-            "format=nv12,hwupload",
-            "-c:v",
-            "h264_vaapi",
-            "-qp",
-            "23",
-        ]);
-    } else {
-        args.extend([
-            "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
-        ]);
-    }
-    args.extend([
-        "-threads", "2", "-c:a", "aac", "-b:a", "128k", "-f", "matroska", "pipe:1",
-    ]);
-    args.into_iter().map(str::to_owned).collect()
-}
-
-pub fn command(config: &Config, profile: &str) -> Command {
+pub fn command(config: &Config, arguments: &[String]) -> Command {
     let mut command = Command::new(&config.ffmpeg.binary);
     command
-        .args(arguments(profile, &config.ffmpeg.vaapi_device))
+        .args(arguments)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -106,124 +52,91 @@ async fn bounded_text<R: tokio::io::AsyncRead + Unpin>(
     }
 }
 
-async fn probe(binary: &str, args: &[&str]) -> Result<String, String> {
+async fn probe<S: AsRef<OsStr>>(binary: &str, args: &[S]) -> Result<String, String> {
     let mut child = Command::new(binary)
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true)
+        .process_group(0)
         .spawn()
         .map_err(|e| format!("cannot launch {binary}: {e}"))?;
-    let stdout = tokio::spawn(bounded_text(child.stdout.take().unwrap()));
-    let stderr = tokio::spawn(bounded_text(child.stderr.take().unwrap()));
-    let status = match tokio::time::timeout(Duration::from_secs(20), child.wait()).await {
-        Ok(status) => status.map_err(|e| e.to_string()),
-        Err(_) => {
-            let _ = child.start_kill();
-            let _ = child.wait().await;
-            Err(format!("{binary} capability probe timed out"))
+    let pid = child.id();
+    let stdout = child.stdout.take().unwrap();
+    let stderr = child.stderr.take().unwrap();
+    // Include draining in the deadline: descendants must not keep probe pipes open.
+    let result = tokio::time::timeout(Duration::from_secs(20), async {
+        let (status, out, err) =
+            tokio::join!(child.wait(), bounded_text(stdout), bounded_text(stderr));
+        let status = status.map_err(|e| e.to_string())?;
+        let out = out.map_err(|e| e.to_string())?;
+        let err = err.map_err(|e| e.to_string())?;
+        if !status.success() {
+            return Err(format!(
+                "{binary} probe exited {status}: {}",
+                sanitized_tail(&err)
+            ));
         }
-    };
-    let out = stdout
-        .await
-        .map_err(|e| e.to_string())?
-        .map_err(|e| e.to_string())?;
-    let err = stderr
-        .await
-        .map_err(|e| e.to_string())?
-        .map_err(|e| e.to_string())?;
-    let status = status?;
-    if !status.success() {
-        return Err(format!(
-            "{binary} probe exited {status}: {}",
-            sanitized_tail(&err)
-        ));
+        Ok(sanitized_tail(&out))
+    })
+    .await;
+    // Reap the direct child and kill any descendants on every exit path.
+    if let Some(pid) = pid {
+        unsafe {
+            libc::kill(-(pid as i32), libc::SIGKILL);
+        }
     }
-    Ok(sanitized_tail(&out))
+    let _ = child.start_kill();
+    let _ = child.wait().await;
+    result.unwrap_or_else(|_| Err(format!("{binary} capability probe timed out")))
 }
 
-pub async fn profiles(config: &Config) -> Vec<Profile> {
-    let baseline = async {
-        probe(&config.ffmpeg.binary, &["-version"]).await?;
-        probe("ffprobe", &["-version"]).await?;
-        probe(&config.ffmpeg.binary, &["-hide_banner", "-encoders"]).await
-    }
-    .await;
-    let mut profiles = Vec::with_capacity(config.profiles.enabled.len());
-    for id in &config.profiles.enabled {
+pub async fn profiles(config: &Config) -> Result<Vec<Profile>, String> {
+    // Parse all enabled recipes before launching probes or binding the listener.
+    let mut profiles = profile::load(config)?;
+    let baseline = probe("ffprobe", &["-version"]).await;
+    let copy_guard = if profiles.iter().any(|profile| profile.copy_aac) {
+        probe(&config.ffmpeg.binary, &["-hide_banner", "-bsfs"])
+            .await
+            .and_then(|filters| {
+                if filters.lines().any(|line| line.trim() == "aac_adtstoasc") {
+                    Ok(())
+                } else {
+                    Err("FFmpeg AAC-copy guard aac_adtstoasc is unavailable".into())
+                }
+            })
+    } else {
+        Ok(())
+    };
+    for profile in &mut profiles {
         let availability = match &baseline {
             Err(error) => Err(error.clone()),
-            Ok(encoders) => validate_profile(config, id, encoders).await,
+            Ok(_) if profile.copy_aac && copy_guard.is_err() => copy_guard.clone(),
+            Ok(_) => validate_profile(config, profile).await,
         };
-        let reason = availability.err();
-        profiles.push(Profile {
-            id: id.clone(),
-            available: reason.is_none(),
-            reason,
-        });
+        profile.reason = availability.err();
+        profile.available = profile.reason.is_none();
     }
-    profiles
+    Ok(profiles)
 }
 
-async fn validate_profile(config: &Config, profile: &str, encoders: &str) -> Result<(), String> {
-    let encoder = if profile == VAAPI_PROFILE {
-        "h264_vaapi"
-    } else {
-        "libx264"
-    };
-    for required in [encoder, "aac"] {
-        if !encoders
-            .lines()
-            .any(|line| line.split_whitespace().nth(1) == Some(required))
-        {
-            return Err(format!("FFmpeg encoder {required} is unavailable"));
+async fn validate_profile(config: &Config, profile: &Profile) -> Result<(), String> {
+    if profile.vaapi {
+        let device = &config.ffmpeg.vaapi_device;
+        let metadata =
+            std::fs::metadata(device).map_err(|e| format!("VAAPI device {device}: {e}"))?;
+        if !metadata.file_type().is_char_device() {
+            return Err(format!("VAAPI device {device} is not a character device"));
         }
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(device)
+            .map_err(|e| format!("VAAPI device permissions {device}: {e}"))?;
+        probe("vainfo", &["--display", "drm", "--device", device]).await?;
     }
-    if profile == CPU_PROFILE {
-        return Ok(());
-    }
-    let device = &config.ffmpeg.vaapi_device;
-    let metadata = std::fs::metadata(device).map_err(|e| format!("VAAPI device {device}: {e}"))?;
-    if !metadata.file_type().is_char_device() {
-        return Err(format!("VAAPI device {device} is not a character device"));
-    }
-    std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(device)
-        .map_err(|e| format!("VAAPI device permissions {device}: {e}"))?;
-    probe("vainfo", &["--display", "drm", "--device", device]).await?;
-    probe(
-        &config.ffmpeg.binary,
-        &[
-            "-hide_banner",
-            "-nostdin",
-            "-loglevel",
-            "error",
-            "-vaapi_device",
-            device,
-            "-filter_threads",
-            "1",
-            "-f",
-            "lavfi",
-            "-i",
-            "testsrc2=size=128x128:rate=10",
-            "-frames:v",
-            "2",
-            "-vf",
-            "format=nv12,hwupload",
-            "-c:v",
-            "h264_vaapi",
-            "-qp",
-            "23",
-            "-an",
-            "-f",
-            "null",
-            "-",
-        ],
-    )
-    .await?;
+    probe(&config.ffmpeg.binary, &profile.probe_arguments).await?;
     Ok(())
 }
 
@@ -238,21 +151,5 @@ mod tests {
         append_tail(&mut tail, b"\x1bwarning\n", 8);
         assert_eq!(tail.len(), 8);
         assert_eq!(sanitized_tail(&tail), "warning\n");
-    }
-
-    #[test]
-    fn protocols_are_restricted_for_both_profiles() {
-        for profile in [CPU_PROFILE, VAAPI_PROFILE] {
-            let args = arguments(profile, "/dev/dri/renderD129");
-            let whitelist = args
-                .iter()
-                .position(|arg| arg == "-protocol_whitelist")
-                .unwrap();
-            let input = args.iter().position(|arg| arg == "-i").unwrap();
-            assert!(whitelist < input);
-            assert_eq!(args[whitelist + 1], "pipe");
-            assert_eq!(args[input + 1], "pipe:0");
-            assert_eq!(args.last().unwrap(), "pipe:1");
-        }
     }
 }

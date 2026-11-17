@@ -1,6 +1,6 @@
 # HTTP streaming transcoder
 
-A single-node Rust/Tokio service which pipes a streamed HTTP upload through one FFmpeg process and returns Matroska over a **separate, concurrent HTTP download**. The baseline profile produces H.264 video and optional AAC audio; an opt-in VAAPI profile uses software decoding and hardware H.264 encoding.
+A single-node Rust/Tokio service which pipes a streamed HTTP upload through one FFmpeg process and returns Matroska over a **separate, concurrent HTTP download**. File-based profiles configure H.264, AV1, or HEVC video and AAC encoding or strict AAC copying. The default enables only CPU H.264; VAAPI H.264 is opt-in.
 
 The server uses Axum for HTTP routing and Tokio for asynchronous I/O and process supervision. The Rust CLI uses Reqwest to upload and download concurrently.
 
@@ -43,7 +43,7 @@ GET /output    <- bounded HTTP chunks <- FFmpeg stdout
 
 One supervisor owns child termination/reaping, terminal state, and its scheduler permit. Upload, output, and stderr drain concurrently. A terminal state is published only after child/resource cleanup. FFmpeg exit zero alone is insufficient: accepted full upload, stdout EOF, and a successfully finished HTTP body are also required. `completed` does **not** prove durable remote storage.
 
-Media chunks are 32 KiB, with a bounded two-chunk output channel. Fixed profiles use two FFmpeg decoder/encoder threads and a pipe-only input protocol allowlist; these bounds do not limit FFmpeg's internal codec buffers.
+Media chunks are 32 KiB, with a bounded two-chunk output channel. Profiles configure decoder and encoder resource settings; the shipped profiles use two decoder threads. A pipe-only input protocol allowlist restricts media access. These bounds do not limit FFmpeg's internal codec buffers.
 
 States are `queued`, `ready`, `running`, `draining`, then `completed`, `failed`, `cancelled`, or `expired`. A queued job has no FFmpeg child. One input and one output can attach, once only; disconnects cannot resume. A failed session does not later become completed. DELETE is idempotent while retained metadata exists.
 
@@ -142,16 +142,86 @@ curl --fail-with-body -X DELETE -H "Authorization: Bearer $TOKEN" "$BASE/v1/sess
 | `timeouts.ready_attach_secs` | `30`; both streams must attach, not merely output |
 | `timeouts.input_idle_secs` | `120`; waiting for another upload chunk, excluding pipe backpressure |
 | `timeouts.output_stall_secs` | `120`; output available but downstream not progressing |
-| `timeouts.max_session_secs` | `7200`, from READY through draining; `0` disables |
+| `timeouts.max_session_secs` | `7200`, from READY through draining; `1..604800`, or `0` disables |
 | `timeouts.terminal_retention_secs` | `600`; then status becomes 404 |
 | `timeouts.shutdown_grace_secs` | `10` |
 | `ffmpeg.binary` | `/usr/bin/ffmpeg` |
 | `ffmpeg.vaapi_device` | `/dev/dri/renderD128`; select the actual render node |
 | `ffmpeg.max_stderr_tail_bytes` | `65536`; bounded recent diagnostics |
 | `ffmpeg.max_input_bytes` | `0` means unlimited; otherwise per-session upload limit |
-| `profiles.enabled` | `["h264-cpu-mkv"]`; optional `"h264-vaapi-mkv"` |
+| `profiles.directory` | `"profiles"`; relative to the config file's parent, or the working directory when `--config` is omitted |
+| `profiles.enabled` | `["h264-cpu-mkv"]`; only listed file IDs are loaded and exposed |
 
-Startup probes encoder availability and real synthetic encoding. A configured unavailable GPU profile fails readiness and rejects GPU creation without disabling an available CPU profile. Profiles are fixed server-owned argument vectors; client data cannot supply paths, URLs, executable names, or codec arguments. Input protocols are restricted so media cannot freely fetch external references.
+Startup probes each enabled encoder with a real short synthetic encode using its configured parameters. An unavailable encoder/device makes that profile unavailable, causes `/readyz` to return 503, and rejects creation for that profile without disabling available profiles. Malformed configuration, invalid/duplicate IDs, or missing enabled files fail startup. Disabled files are not parsed or probed.
+
+### File-based profiles
+
+Each ID names one `<profiles.directory>/<id>.toml` file; there is no `id` field inside it. IDs are 1–64 ASCII lowercase letters, digits, or hyphens, beginning with a letter or digit. Paths, dots, and traversal are forbidden. Files are loaded and compiled once at startup; **restart after editing**. Missing files never fall back to built-in recipes.
+
+The repository and container ship these four recipes:
+
+| ID | Video | Audio |
+|---|---|---|
+| `h264-cpu-mkv` | libx264, CRF 23, veryfast, threads 2 | Encode every audio track to AAC 128 kbps |
+| `h264-vaapi-mkv` | h264_vaapi, QP 23, threads 2 | Encode every audio track to AAC 128 kbps |
+| `av1-crf30-preset6-mkv` | libsvtav1, CRF 30, preset 6, `lp=12` | Copy first audio track, AAC only |
+| `hevc-crf26-slow-mkv` | libx265, CRF 26, slow, `pools=12:frame-threads=3` | Copy first audio track, AAC only |
+
+To expose AV1 and HEVC in **`/v1/profiles`**, replace the CPU-only enabled list in your main config, then restart:
+
+```toml
+[profiles]
+directory = "profiles"
+enabled = ["h264-cpu-mkv", "av1-crf30-preset6-mkv", "hevc-crf26-slow-mkv"]
+```
+
+Use `--profile av1-crf30-preset6-mkv` or `--profile hevc-crf26-slow-mkv` with the client. Your FFmpeg build must support `libsvtav1` or `libx265`, respectively. Enable `h264-vaapi-mkv` separately when the render node and driver are ready.
+
+To add a custom profile, copy a recipe beside your config's other profile files, edit its typed settings, and add its filename stem to `profiles.enabled`:
+
+```sh
+cp profiles/hevc-crf26-slow-mkv.toml profiles/archive-hevc.toml
+# Edit profiles/archive-hevc.toml, for example crf = 28.
+# Add "archive-hevc" to profiles.enabled in config.toml, then restart.
+# Select it with: transcoder-client ... --profile archive-hevc
+```
+
+For example, the shipped HEVC file contains:
+
+```toml
+decoder_threads = 2
+
+[video]
+encoder = "libx265"
+crf = 26
+preset = "slow"
+pools = 12
+frame_threads = 3
+
+[audio]
+mode = "copy_aac"
+streams = "first"
+```
+
+All recipe fields are explicit. Unknown fields/tables, unsupported encoder/audio variants, and fields belonging to another variant are rejected:
+
+| Location / variant | Required fields and valid values |
+|---|---|
+| Root | `decoder_threads`: integer `1..64`; `[video]` and `[audio]` tables |
+| `video.encoder = "libx264"` | `crf`: integer `0..51`; `preset`: name below; `threads`: integer `1..64` |
+| `video.encoder = "h264_vaapi"` | `qp`: integer `0..51`; `threads`: integer `1..64` |
+| `video.encoder = "libsvtav1"` | `crf`: integer `0..63`; `preset`: integer `0..13`; `logical_processors`: integer `1..64` |
+| `video.encoder = "libx265"` | `crf`: integer `0..51`; `preset`: name below; `pools`: integer `1..64`; `frame_threads`: integer `1..16` |
+| `audio.mode = "aac"` | `bitrate_kbps`: integer `8..512`; `streams`: `"all"` or `"first"` |
+| `audio.mode = "copy_aac"` | `streams`: `"all"` or `"first"`; no bitrate setting or re-encoding |
+
+x264/x265 preset names: `ultrafast`, `superfast`, `veryfast`, `faster`, `fast`, `medium`, `slow`, `slower`, `veryslow`, `placebo`. `streams = "all"` selects optional `0:a?`; `"first"` selects optional `0:a:0?`. Every profile selects the first video stream.
+
+**Strict AAC copy:** the AV1/HEVC recipes copy only the first audio track, not the first *AAC* track. A missing audio track is valid. If the first track is MP3, Opus, or another non-AAC codec, the job fails, the output body is aborted rather than ending normally, and final status/bounded stderr reports the AAC-only filter failure. Later tracks are ignored, even if they are AAC. AAC is not decoded/re-encoded: `-c:a copy -bsf:a aac_adtstoasc` preserves packet payloads where packaging already matches, and may convert ADTS framing to AudioSpecificConfig.
+
+The fixed pipeline reads `pipe:0`, maps video/audio, and writes `-f matroska pipe:1`. Software video uses `yuv420p`; VAAPI uses `format=nv12,hwupload`. Source dimensions, frame rate, and timing are retained: no resizing, `-r`, frame-rate resampling, frame interpolation, or `-t` time truncation is added. `-enc_time_base:v -1` preserves the source video time base rather than rounding video timestamps to whole frame intervals, keeping copied AAC aligned. There are no MP4 `faststart`, `movflags`, or `hvc1` flags; MP4 remuxing/tagging belongs downstream. The session deadline can fail an overlong job, never silently turn it into a successful shortened encode. Clients cannot supply paths, URLs, executable names, or raw codec arguments; input protocols remain pipe-only.
+
+**CPU resources and long jobs:** `decoder_threads` controls input decoding, not the encoder's workers. AV1 `logical_processors` compiles to `-svtav1-params lp=12` in the shipped recipe; HEVC `pools` and `frame_threads` compile to `-x265-params pools=12:frame-threads=3`. These are not low-resource recipes and are not replaced by generic `-threads 2`. Start with `scheduler.max_concurrent_jobs = 1`. Docker/Compose's two-CPU quota still restricts scheduling despite those worker counts; change quotas deliberately after considering RAM/PID limits. Long CPU encodes can exceed `timeouts.max_session_secs = 7200`: increase it up to `604800`, or use `0` to disable, and also increase the client's `--deadline-secs` (default `7500`) for encoding plus queueing and transfer time.
 
 ## Docker
 
@@ -163,7 +233,7 @@ docker compose up --build -d
 docker compose logs -f transcoder
 ```
 
-The Compose service publishes port 8080 and mounts `./config.toml` read-only. Use the same client against `http://127.0.0.1:8080`. Review the published address before exposing it to a LAN. Container binding and published port must agree. The image runs non-root with FFmpeg installed; Compose restricts capabilities/resources, uses a read-only filesystem, and gives shutdown time for reaping. Do not mount the Docker socket, use privileged mode, or write media into the server container.
+The Compose service publishes port 8080 and mounts both `./config.toml` and `./profiles` read-only. Custom profile files therefore remain host-managed. The image also ships all four recipes at `/etc/transcoder/profiles`; `directory = "profiles"` in `/etc/transcoder/config.toml` resolves there regardless of the container working directory. A directory bind mount replaces that image directory, so include every enabled recipe in it. Use the same client against `http://127.0.0.1:8080`. Review the published address before exposing it to a LAN. Container binding and published port must agree. The image runs non-root with FFmpeg installed; Compose restricts capabilities/resources, uses a read-only filesystem, and gives shutdown time for reaping. Do not mount the Docker socket, use privileged mode, or write media into the server container.
 
 The multi-stage image builds with `rust:1.93-bookworm` and runs on `debian:trixie-slim`, using the newer distribution's FFmpeg/Mesa VAAPI packages for recent AMD hardware. Package availability alone is not evidence that a GPU encode works.
 
@@ -188,6 +258,7 @@ docker run --rm --init --read-only --cap-drop ALL \
   --security-opt no-new-privileges:true --pids-limit 256 --memory 2g --cpus 2 \
   -p 127.0.0.1:8080:8080 -e TRANSCODER_API_TOKEN \
   -v "$(pwd)/config.toml:/etc/transcoder/config.toml:ro" \
+  -v "$(pwd)/profiles:/etc/transcoder/profiles:ro" \
   ghcr.io/swind/rust-ffmpeg-transcoder:latest
 ```
 
@@ -206,7 +277,7 @@ vainfo --display drm --device /dev/dri/renderD128
 ffmpeg -hide_banner -encoders | grep h264_vaapi
 ```
 
-Enable both profiles in `config.toml`, set `ffmpeg.vaapi_device`, and give the non-root container the render node plus its numeric group. For example create a local Compose override (replace `993` with `stat`'s actual output):
+Set `profiles.enabled = ["h264-cpu-mkv", "h264-vaapi-mkv"]` in `config.toml` (retain AV1/HEVC IDs too if wanted), set `ffmpeg.vaapi_device`, and give the non-root container the render node plus its numeric group. For example create a local Compose override (replace `993` with `stat`'s actual output):
 
 ```yaml
 services:
@@ -241,7 +312,7 @@ python3 scripts/acceptance.py \
   --server target/debug/transcoder-server --client target/debug/transcoder-client
 ```
 
-The integration harness starts isolated servers and uses temporary media files. It requires Linux `/proc`, Python 3, FFmpeg/ffprobe, and approximately 1 GiB of temporary disk space. GPU checks are separate. Use `--only SCENARIO` to run an individual scenario.
+The integration harness starts isolated servers and uses temporary client-side media files. It requires Linux `/proc`, Python 3, FFmpeg/ffprobe, and approximately 1 GiB of temporary disk space. GPU checks are separate. Use `--only SCENARIO` to run an individual group. `--only profiles` performs real short AV1/HEVC encodes, checks dimensions/frame count/fractional frame rate/timestamps, AAC packet hashes and first-track selection, absent audio, non-AAC failure with aborted output, cleanup/permit reuse, and an arbitrary filename profile whose lossless setting is verified against decoded source pixels. This group requires `libsvtav1`, `libx265`, and `libmp3lame` alongside the baseline codecs. On hosts lacking an optional encoder, `--allow-unavailable-profiles` explicitly permits availability/rejection checks instead of that encoder's media cases, and reports the skip; without it, missing capability fails the group. It is not a substitute for running both real encoders on a capable host.
 
 ## Limitations and troubleshooting
 
@@ -251,7 +322,7 @@ The integration harness starts isolated servers and uses temporary media files. 
 - HTTP 409: wait for READY, attach output before input, and do not retry an already attached stream. Create a new session after failure.
 - HTTP 411: use a regular input file and explicit Content-Length; chunked uploads are not the MVP contract.
 - Queue full can also reflect retained metadata capacity. Tune queue/concurrency/retention together; do not launch more jobs than CPU/RAM/PID capacity supports.
-- `/readyz` fails only with GPU enabled: inspect `/v1/profiles` reasons, device mapping, numeric render group, `vainfo`, Mesa driver, and a real encode. CPU profile can still be used if available.
+- `/readyz` fails with an optional profile enabled: inspect `/v1/profiles` reasons and FFmpeg encoder support. For VAAPI, also check device mapping, numeric render group, `vainfo`, Mesa driver, and a real encode. Available profiles remain usable.
 - Test directly against the server. Reverse-proxy request/response buffering defeats streaming and can deadlock the two-stream workflow. Any later proxy needs buffering disabled and suitable idle limits.
 - Media is untrusted input to FFmpeg. Keep FFmpeg patched, use a trusted network, authenticate, run non-root with container resource limits, and treat bounded stderr as untrusted text.
-- Sessions disappear on restart. There is no resume, fan-out, persistent acknowledgement, multi-node scheduling, arbitrary codec configuration, or guaranteed durable receipt.
+- Sessions disappear on restart. There is no resume, fan-out, persistent acknowledgement, multi-node scheduling, arbitrary FFmpeg argument configuration, or guaranteed durable receipt.

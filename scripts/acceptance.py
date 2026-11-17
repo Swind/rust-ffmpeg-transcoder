@@ -5,6 +5,7 @@ import argparse
 import concurrent.futures
 import select
 import contextlib
+from fractions import Fraction
 import http.client
 import json
 import os
@@ -18,10 +19,11 @@ import threading
 import time
 import traceback
 
-from fixtures import generate
+from fixtures import generate, generate_profiles
 
 TOKEN = "isolated-acceptance-token"
 TERMINAL = {"completed", "failed", "cancelled", "expired"}
+PROFILE_DIRECTORY = Path(__file__).resolve().parent.parent / "profiles"
 
 
 def check(condition, message):
@@ -102,10 +104,93 @@ def probe(path, audio=False, duration=None):
     return data
 
 
+def inspect_media(path, *options):
+    result = subprocess.run(
+        ["ffprobe", "-v", "error", *options, "-of", "json", str(path)],
+        capture_output=True, text=True, timeout=60, check=True,
+    )
+    check(not result.stderr.strip(), f"ffprobe reported damage in {path}: {result.stderr}")
+    return json.loads(result.stdout)
+
+
+def profile_video(path):
+    data = inspect_media(
+        path, "-select_streams", "v:0", "-show_frames", "-show_streams",
+        "-show_entries",
+        "stream=codec_name,width,height,avg_frame_rate,r_frame_rate:frame=best_effort_timestamp_time",
+    )
+    check(len(data["streams"]) == 1, f"missing video stream: {data}")
+    stamps = [float(frame["best_effort_timestamp_time"]) for frame in data["frames"]]
+    check(stamps and all(a < b for a, b in zip(stamps, stamps[1:])),
+          f"missing/nonmonotonic frame timestamps in {path}: {stamps}")
+    return data["streams"][0], stamps
+
+
+def compare_timestamps(source, output, label):
+    check(len(source) == len(output), f"{label} count changed: {len(source)} -> {len(output)}")
+    check(all(abs((a - source[0]) - (b - output[0])) <= 0.003
+              for a, b in zip(source, output)), f"{label} timing changed: {source} -> {output}")
+    check(abs(source[0] - output[0]) <= 0.1,
+          f"{label} timestamp origin shifted excessively: {source[0]} -> {output[0]}")
+
+
+def verify_profile_media(source, output, codec, audio):
+    before, source_stamps = profile_video(source)
+    after, output_stamps = profile_video(output)
+    check(after["codec_name"] == codec, f"wrong profile codec: {after}")
+    check((after["width"], after["height"]) == (before["width"], before["height"]) == (192, 128),
+          f"profile resized video: {before} -> {after}")
+    check(len(source_stamps) == 30, f"unexpected source fixture frame count: {source_stamps}")
+    for field in ("r_frame_rate", "avg_frame_rate"):
+        check(Fraction(after[field]) == Fraction(before[field]) == Fraction(24000, 1001),
+              f"profile changed {field}: {before} -> {after}")
+    compare_timestamps(source_stamps, output_stamps, "video frames")
+    streams = inspect_media(output, "-show_streams")["streams"]
+    check(len([stream for stream in streams if stream["codec_type"] == "video"]) == 1,
+          f"unexpected extra video: {streams}")
+    sound = [stream for stream in streams if stream["codec_type"] == "audio"]
+    check(len(sound) == int(audio), f"wrong first-track/no-audio mapping: {streams}")
+    if not audio:
+        return
+    check(sound[0]["codec_name"] == "aac", f"audio not AAC: {sound}")
+    options = ("-select_streams", "a:0", "-show_packets", "-show_data_hash", "sha256",
+               "-show_entries", "packet=pts_time,data_hash")
+    original = inspect_media(source, *options)["packets"]
+    copied = inspect_media(output, *options)["packets"]
+    check(original and all("data_hash" in packet for packet in original + copied),
+          "missing AAC packet payload hashes")
+    check([packet["data_hash"] for packet in original] == [packet["data_hash"] for packet in copied],
+          "AAC packets were dropped, modified, or re-encoded")
+    original_stamps = [float(packet["pts_time"]) for packet in original]
+    copied_stamps = [float(packet["pts_time"]) for packet in copied]
+    compare_timestamps(original_stamps, copied_stamps, "AAC packets")
+    source_offset = original_stamps[0] - source_stamps[0]
+    output_offset = copied_stamps[0] - output_stamps[0]
+    check(abs(source_offset - output_offset) <= 0.003,
+          f"audio/video alignment changed: source audio={original_stamps[0]:.6f}s "
+          f"video={source_stamps[0]:.6f}s offset={source_offset:.6f}s; "
+          f"output audio={copied_stamps[0]:.6f}s video={output_stamps[0]:.6f}s "
+          f"offset={output_offset:.6f}s; drift={output_offset - source_offset:.6f}s")
+
+
+def decoded_video_hashes(path):
+    result = subprocess.run(
+        ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-i", str(path),
+         "-map", "0:v:0", "-an", "-f", "framemd5", "pipe:1"],
+        capture_output=True, text=True, timeout=60, check=True,
+    )
+    check(not result.stderr.strip(), f"decoded frame verification failed: {result.stderr}")
+    hashes = [line.rsplit(",", 1)[-1].strip() for line in result.stdout.splitlines()
+              if line and not line.startswith("#")]
+    check(len(hashes) == 30, f"missing decoded frames in {path}")
+    return hashes
+
+
 class Server:
-    def __init__(self, executable, root, **overrides):
+    def __init__(self, executable, root, require_ready=True, **overrides):
         self.executable = executable
         self.root = Path(tempfile.mkdtemp(prefix="server-", dir=root))
+        self.require_ready = require_ready
         with socket.socket() as sock:
             sock.bind(("127.0.0.1", 0))
             self.port = sock.getsockname()[1]
@@ -119,7 +204,7 @@ class Server:
                          "shutdown_grace_secs": 3},
             "ffmpeg": {"binary": shutil.which("ffmpeg"), "max_stderr_tail_bytes": 4096,
                        "max_input_bytes": 0, "vaapi_device": "/dev/dri/renderD128"},
-            "profiles": {"enabled": ["h264-cpu-mkv"]},
+            "profiles": {"directory": str(PROFILE_DIRECTORY), "enabled": ["h264-cpu-mkv"]},
         }
         for section, values in overrides.items():
             self.settings[section].update(values)
@@ -145,10 +230,11 @@ class Server:
             def ready():
                 check(self.process.poll() is None, "server exited during startup")
                 try:
-                    return self.request("GET", "/readyz", token=None)[0] == 200
+                    route = "/readyz" if self.require_ready else "/healthz"
+                    return self.request("GET", route, token=None)[0] == 200
                 except (OSError, http.client.HTTPException):
                     return False
-            until(ready, 30, "server readiness")
+            until(ready, 90, "server startup and profile probes")
         except BaseException as error:
             self.__exit__(type(error), error, error.__traceback__)
             raise
@@ -503,6 +589,74 @@ class Suite:
                 transfer.finish()
                 probe(transfer.destination, duration=30)
 
+    def profiles(self):
+        fixtures = generate_profiles(self.root / "profile-fixtures")
+        recipes = self.root / "custom-profiles"
+        shutil.copytree(PROFILE_DIRECTORY, recipes)
+        custom_id = "configured-lossless-archive"
+        # A new filename, different settings, and decoded-pixel equality prove that
+        # the server compiled this file instead of selecting a hardcoded ID recipe.
+        (recipes / f"{custom_id}.toml").write_text(
+            'decoder_threads = 1\n'
+            '[video]\nencoder = "libx264"\npreset = "ultrafast"\ncrf = 0\nthreads = 1\n'
+            '[audio]\nmode = "copy_aac"\nstreams = "first"\n'
+        )
+        variants = {"av1-crf30-preset6-mkv": "av1", "hevc-crf26-slow-mkv": "hevc",
+                    custom_id: "h264"}
+        enabled = ["h264-cpu-mkv", *variants]
+        with self.server(require_ready=False,
+                         profiles={"directory": str(recipes), "enabled": enabled}) as server:
+            code, response = server.request("GET", "/v1/profiles")
+            check(code == 200, f"profiles request failed: {code} {response}")
+            advertised = {profile["id"]: profile for profile in response["profiles"]}
+            check(set(advertised) == set(enabled), f"enabled file IDs not reflected: {response}")
+            check(advertised["h264-cpu-mkv"]["available"], f"baseline CPU unavailable: {response}")
+            check(advertised[custom_id]["available"], f"custom recipe unavailable: {response}")
+            readiness = server.request("GET", "/readyz", token=None)[0]
+            check(readiness == (200 if all(p["available"] for p in advertised.values()) else 503),
+                  f"readiness disagrees with profile availability: {readiness} {response}")
+            error_code(server.request("POST", "/v1/sessions", {"profile": "not-a-file"}),
+                       422, "invalid_profile")
+            for profile_id, codec in variants.items():
+                profile = advertised[profile_id]
+                if not profile["available"]:
+                    check(profile.get("reason"), f"unavailable profile lacks reason: {profile}")
+                    error_code(server.request("POST", "/v1/sessions", {"profile": profile_id}),
+                               422, "invalid_profile")
+                    check(not children(server.process.pid), "unavailable profile spawned a child")
+                    check(self.args.allow_unavailable_profiles,
+                          f"{profile_id} unavailable; real encode required: {profile}")
+                    print(f"  SKIP media {profile_id}: {profile['reason']} "
+                          "(availability/rejection only; no encode passed)", flush=True)
+                    server.reuse()
+                    continue
+                for name in ("audio", "silent", "mp3"):
+                    sid = server.create(profile_id)
+                    server.state(sid, "ready")
+                    with Transfer(server, sid, fixtures[name], self.root / f"{sid}.mkv") as transfer:
+                        data = transfer.finish(success=name != "mp3")
+                        check(data["profile"] == profile_id, f"selected file ID lost: {data}")
+                        if name == "mp3":
+                            check(data["state"] == "failed", f"non-AAC input not failed: {data}")
+                            diagnostic = json.dumps({"error": data.get("error"),
+                                                     "stderr_tail": data.get("stderr_tail", ""),
+                                                     "ffmpeg": data["ffmpeg"]}).lower()
+                            check("aac" in diagnostic and
+                                  ("mp3" in diagnostic or "aac-only" in diagnostic or
+                                   "only aac" in diagnostic),
+                                  f"missing actionable AAC-only diagnostic: {data}")
+                            check(data["error"] is not None, f"failure lost error: {data}")
+                        else:
+                            verify_profile_media(fixtures[name], transfer.destination, codec,
+                                                 audio=name == "audio")
+                            if profile_id == custom_id:
+                                check(decoded_video_hashes(fixtures[name]) ==
+                                      decoded_video_hashes(transfer.destination),
+                                      "custom CRF 0 recipe did not produce lossless decoded pixels")
+                    server.reuse()
+                print(f"  encoded {profile_id}: AAC-copy/no-audio passed; "
+                      "MP3-first rejected with aborted body; permit reused", flush=True)
+
     def scheduler(self):
         with self.server() as server:
             first = server.create()
@@ -808,28 +962,32 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--server", required=True, type=Path)
     parser.add_argument("--client", required=True, type=Path)
-    parser.add_argument("--only", choices=["api", "media", "scheduler", "disconnects", "failures",
-                                          "timeouts", "backpressure", "mp4", "shutdown", "cli"],
+    parser.add_argument("--only", choices=["api", "media", "profiles", "scheduler", "disconnects",
+                                          "failures", "timeouts", "backpressure", "mp4", "shutdown", "cli"],
                         help="Run one real scenario while debugging (default: entire matrix)")
+    parser.add_argument("--allow-unavailable-profiles", action="store_true",
+                        help="Explicitly skip optional AV1/HEVC media cases only when API reports unavailable")
     args = parser.parse_args()
     args.server, args.client = args.server.resolve(), args.client.resolve()
     for tool in ("ffmpeg", "ffprobe"):
         check(shutil.which(tool), f"required executable missing: {tool}")
     check(Path("/proc/self/status").exists(), "Linux /proc is required for reaping/RSS assertions")
     check(args.server.is_file() and args.client.is_file(), "build both Rust binaries first")
-    names = [args.only] if args.only else ["api", "media", "scheduler", "disconnects", "failures",
+    names = [args.only] if args.only else ["api", "media", "profiles", "scheduler", "disconnects", "failures",
                                          "timeouts", "backpressure", "mp4", "shutdown", "cli"]
     with tempfile.TemporaryDirectory(prefix="transcoder-acceptance-") as directory:
         root = Path(directory)
         print(f"Generating real FFmpeg fixtures in {root}", flush=True)
-        fixtures = generate(root / "fixtures", backpressure="backpressure" in names)
+        fixtures = (generate(root / "fixtures", backpressure="backpressure" in names)
+                    if any(name != "profiles" for name in names) else {})
         suite = Suite(args, root, fixtures)
         for name in names:
             started = time.monotonic()
             print(f"RUN {name}", flush=True)
             getattr(suite, name)()
             print(f"PASS {name} ({time.monotonic() - started:.2f}s)", flush=True)
-    print("CPU acceptance passed. GPU and Docker are separate opt-in real checks.", flush=True)
+    print("Selected acceptance groups passed (any optional skips are listed above). "
+          "GPU and Docker are separate opt-in real checks.", flush=True)
 
 
 if __name__ == "__main__":

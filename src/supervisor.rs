@@ -43,14 +43,13 @@ async fn stderr(
     mut stderr: ChildStderr,
     session: Arc<Session>,
     limit: usize,
-    cancel: CancellationToken,
 ) -> Result<(), Failure> {
     let mut buffer = [0; 4096];
     loop {
-        let count = tokio::select! {
-            _ = cancel.cancelled() => return Ok(()),
-            count = stderr.read(&mut buffer) => count.map_err(|e| Failure::new("ffmpeg_failed", format!("stderr read failed: {e}")))?,
-        };
+        let count = stderr
+            .read(&mut buffer)
+            .await
+            .map_err(|e| Failure::new("ffmpeg_failed", format!("stderr read failed: {e}")))?;
         if count == 0 {
             return Ok(());
         }
@@ -66,13 +65,14 @@ pub async fn run(
     session: Arc<Session>,
     mut commands: mpsc::Receiver<Control>,
     config: Arc<Config>,
+    arguments: Arc<[String]>,
 ) {
     if session.stop.is_cancelled() {
         finish(&session);
         return;
     }
     let starting = Instant::now();
-    let mut child = match ffmpeg::command(&config, &session.profile).spawn() {
+    let mut child = match ffmpeg::command(&config, &arguments).spawn() {
         Ok(child) => child,
         Err(error) => {
             session.fail(Failure::new(
@@ -87,14 +87,12 @@ pub async fn run(
     let mut stdin = child.stdin.take();
     let mut stdout = child.stdout.take();
     let stderr_pipe = child.stderr.take().expect("FFmpeg stderr is piped");
-    let stderr_cancel = CancellationToken::new();
     let mut tasks = JoinSet::new();
     let stderr_session = session.clone();
     let stderr_limit = config.ffmpeg.max_stderr_tail_bytes;
-    let stderr_stop = stderr_cancel.clone();
-    tasks.spawn(async move {
-        Event::Stderr(stderr(stderr_pipe, stderr_session, stderr_limit, stderr_stop).await)
-    });
+    tasks.spawn(
+        async move { Event::Stderr(stderr(stderr_pipe, stderr_session, stderr_limit).await) },
+    );
     {
         let mut meta = session.meta.lock().unwrap();
         meta.state = State::Ready;
@@ -259,7 +257,8 @@ pub async fn run(
         terminate(&mut child, pid, &mut exit, config.shutdown_grace()).await;
         // Closing the read side reclaims its bounded queue even if Hyper is not polling.
         session.output.lock().unwrap().take();
-        stderr_cancel.cancel();
+        // The process group is gone; drain stderr to EOF rather than cancelling
+        // it and losing the actual encoder/bitstream-filter failure diagnostic.
     }
     drop(output_gate);
     while let Some(result) = tasks.join_next().await {

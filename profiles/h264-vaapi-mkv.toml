@@ -1,0 +1,11 @@
+decoder_threads = 2
+
+[video]
+encoder = "h264_vaapi"
+qp = 23
+threads = 2
+
+[audio]
+mode = "aac"
+bitrate_kbps = 128
+streams = "all"

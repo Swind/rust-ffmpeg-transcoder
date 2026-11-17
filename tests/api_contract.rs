@@ -4,21 +4,18 @@ use axum::{
 };
 use serde_json::Value;
 use std::{sync::Arc, time::Duration};
-use streaming_transcoder::{
-    api, config::Config, ffmpeg::Profile, scheduler::AppState, session::State,
-};
+use streaming_transcoder::{api, config::Config, profile, scheduler::AppState, session::State};
 use tower::ServiceExt;
 
+fn fixture_config(mut config: Config) -> Config {
+    config.profiles.directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("profiles");
+    config
+}
+
 fn app(config: Config) -> (Arc<AppState>, tokio::task::JoinHandle<()>) {
-    AppState::start(
-        config,
-        vec![Profile {
-            id: "h264-cpu-mkv".into(),
-            available: true,
-            reason: None,
-        }],
-        Some("test-secret".into()),
-    )
+    let config = fixture_config(config);
+    let profiles = profile::load(&config).unwrap();
+    AppState::start(config, profiles, Some("test-secret".into()))
 }
 
 fn request(method: &str, path: &str, token: Option<&str>, body: &str) -> Request<Body> {
@@ -141,19 +138,12 @@ async fn spawn_failure_releases_slot_and_retains_stable_failure() {
 
 #[tokio::test]
 async fn unavailable_gpu_is_reported_without_disabling_cpu() {
-    let profiles = vec![
-        Profile {
-            id: "h264-cpu-mkv".into(),
-            available: true,
-            reason: None,
-        },
-        Profile {
-            id: "h264-vaapi-mkv".into(),
-            available: false,
-            reason: Some("VAAPI prerequisite missing".into()),
-        },
-    ];
-    let (app, scheduler) = AppState::start(Config::default(), profiles, Some("test-secret".into()));
+    let mut config = fixture_config(Config::default());
+    config.profiles.enabled.push("h264-vaapi-mkv".into());
+    let mut profiles = profile::load(&config).unwrap();
+    profiles[1].available = false;
+    profiles[1].reason = Some("VAAPI prerequisite missing".into());
+    let (app, scheduler) = AppState::start(config, profiles, Some("test-secret".into()));
     let router = api::router(app.clone());
     let ready = router
         .clone()

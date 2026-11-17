@@ -9,6 +9,7 @@ services:
     volumes:
       # Copy config.example.toml and change bind to 0.0.0.0:8080 first.
       - ./config.toml:/etc/transcoder/config.toml:ro
+      - ./profiles:/etc/transcoder/profiles:ro
     # Enable only after validating the actual host node, group and VA driver.
     # devices:
     #   - /dev/dri/renderD128:/dev/dri/renderD128

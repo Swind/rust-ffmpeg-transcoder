@@ -1,7 +1,7 @@
 use crate::{
     config::Config,
     error::ApiError,
-    ffmpeg::Profile,
+    profile::Profile,
     session::{Session, State},
     supervisor::{self, Control},
 };
@@ -22,6 +22,7 @@ use uuid::Uuid;
 struct Entry {
     session: Arc<Session>,
     commands: Option<mpsc::Receiver<Control>>,
+    arguments: Arc<[String]>,
 }
 struct Registry {
     sessions: HashMap<Uuid, Entry>,
@@ -73,17 +74,17 @@ impl AppState {
     }
 
     pub fn create(&self, profile: &str) -> Result<Arc<Session>, ApiError> {
-        if !self
+        let selected = self
             .profiles
             .iter()
-            .any(|known| known.id == profile && known.available)
-        {
-            return Err(ApiError::new(
-                StatusCode::UNPROCESSABLE_ENTITY,
-                "invalid_profile",
-                "profile is unknown, disabled, or unavailable; inspect /v1/profiles",
-            ));
-        }
+            .find(|known| known.id == profile && known.available)
+            .ok_or_else(|| {
+                ApiError::new(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "invalid_profile",
+                    "profile is unknown, disabled, or unavailable; inspect /v1/profiles",
+                )
+            })?;
         let mut registry = self.registry.lock().unwrap();
         if !registry.accepting || self.shutdown.is_cancelled() {
             return Err(ApiError::unavailable());
@@ -109,6 +110,7 @@ impl AppState {
             Entry {
                 session: session.clone(),
                 commands: Some(commands),
+                arguments: selected.arguments.clone(),
             },
         );
         drop(registry);
@@ -196,10 +198,11 @@ async fn schedule(app: Arc<AppState>) {
                     .take()
                     .expect("queued worker has not started");
                 let session = entry.session.clone();
+                let arguments = entry.arguments.clone();
                 let config = app.config.clone();
                 registry.active += 1;
                 workers.spawn(async move {
-                    supervisor::run(session.clone(), commands, config).await;
+                    supervisor::run(session.clone(), commands, config, arguments).await;
                     session
                 });
             }
@@ -250,14 +253,31 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn custom_profile_dispatch_shares_the_precompiled_command() {
+        let mut profile = crate::profile::test_profile();
+        profile.id = "custom-encode".into();
+        let arguments = profile.arguments.clone();
+        let (app, worker) = AppState::start(Config::default(), vec![profile], None);
+        assert!(app.create("h264-cpu-mkv").is_err());
+        assert!(app.create("../custom-encode").is_err());
+        let session = app.create("custom-encode").unwrap();
+        {
+            let registry = app.registry.lock().unwrap();
+            assert!(Arc::ptr_eq(
+                &arguments,
+                &registry.sessions[&session.id].arguments
+            ));
+        }
+        assert_eq!(session.snapshot()["profile"], "custom-encode");
+        app.stop();
+        worker.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn queue_is_bounded_and_fifo_before_scheduler_runs() {
         let mut config = Config::default();
         config.scheduler.max_queued_jobs = 1;
-        let profiles = vec![Profile {
-            id: "h264-cpu-mkv".into(),
-            available: true,
-            reason: None,
-        }];
+        let profiles = vec![crate::profile::test_profile()];
         let (app, worker) = AppState::start(config, profiles, None);
         let first = app.create("h264-cpu-mkv").unwrap();
         let second = app.create("h264-cpu-mkv").unwrap();
@@ -287,11 +307,7 @@ mod tests {
         config.scheduler.max_sessions = 1;
         config.scheduler.max_queued_jobs = 1;
         config.ffmpeg.binary = "/nonexistent/transcoder-regression-ffmpeg".into();
-        let profiles = vec![Profile {
-            id: "h264-cpu-mkv".into(),
-            available: true,
-            reason: None,
-        }];
+        let profiles = vec![crate::profile::test_profile()];
         let (app, worker) = AppState::start(config, profiles, None);
         let session = app.create("h264-cpu-mkv").unwrap();
         tokio::time::timeout(Duration::from_secs(2), async {

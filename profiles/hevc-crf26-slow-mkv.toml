@@ -1,0 +1,12 @@
+decoder_threads = 2
+
+[video]
+encoder = "libx265"
+crf = 26
+preset = "slow"
+pools = 12
+frame_threads = 3
+
+[audio]
+mode = "copy_aac"
+streams = "first"
