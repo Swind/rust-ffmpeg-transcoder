@@ -1,0 +1,29 @@
+services:
+  transcoder:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      TRANSCODER_API_TOKEN: ${TRANSCODER_API_TOKEN:?TRANSCODER_API_TOKEN is required}
+      RUST_LOG: ${RUST_LOG:-info}
+    volumes:
+      # Copy config.example.toml and change bind to 0.0.0.0:8080 first.
+      - ./config.toml:/etc/transcoder/config.toml:ro
+    # Enable only after validating the actual host node, group and VA driver.
+    # devices:
+    #   - /dev/dri/renderD128:/dev/dri/renderD128
+    # group_add:
+    #   - "993" # Replace with: stat -c '%g' /dev/dri/renderD128
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m
+    cpus: 2.0
+    mem_limit: 2g
+    pids_limit: 256
+    init: true
+    restart: unless-stopped
+    stop_grace_period: 15s

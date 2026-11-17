@@ -1,0 +1,39 @@
+[server]
+# For Docker, copy to config.toml and change to 0.0.0.0:8080.
+bind = "127.0.0.1:8080"
+
+[security]
+# Never put bearer secrets in this file. Supply this environment variable.
+token_env = "TRANSCODER_API_TOKEN"
+allow_insecure_no_auth = false
+# Only effective with allow_insecure_no_auth=true and no configured token.
+allow_insecure_non_loopback = false
+
+[scheduler]
+max_concurrent_jobs = 1
+max_queued_jobs = 16
+# Includes terminal metadata retained below; bounds total in-memory sessions.
+max_sessions = 1024
+
+[timeouts]
+# BOTH independent streams must attach within this window.
+ready_attach_secs = 30
+# Counts only time waiting for incoming body data, never stdin backpressure.
+input_idle_secs = 120
+# Starts only when produced bytes (or final response EOF) await consumption.
+output_stall_secs = 120
+max_session_secs = 7200 # 0 disables the overall deadline.
+terminal_retention_secs = 600
+shutdown_grace_secs = 10
+
+[ffmpeg]
+binary = "/usr/bin/ffmpeg"
+vaapi_device = "/dev/dri/renderD128"
+max_stderr_tail_bytes = 65536
+max_input_bytes = 0 # 0 means unlimited; no memory allocation uses this length.
+
+[profiles]
+enabled = ["h264-cpu-mkv"]
+# Optional: ["h264-cpu-mkv", "h264-vaapi-mkv"]
+# VAAPI requires encoder, render-node access, vainfo, and a real synthetic encode.
+# A failed enabled profile makes /readyz return 503; available CPU stays usable.
