@@ -1,0 +1,10 @@
+.git
+.github
+target
+config.toml
+compose.override.yaml
+compose.override.yml
+.env
+.env.*
+**/__pycache__
+**/*.pyc

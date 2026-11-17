@@ -172,6 +172,27 @@ curl --fail http://127.0.0.1:8080/healthz
 docker compose stop
 ```
 
+### Published images (GHCR)
+
+The `Publish container image` GitHub Actions workflow builds `linux/amd64` images from the Dockerfile and publishes them to `ghcr.io/swind/rust-ffmpeg-transcoder`. It runs on pushes to `main`, tags matching `v*`, or manual dispatch from the Actions tab. Authentication uses the repository's `GITHUB_TOKEN` with `packages: write`; no registry secret is required.
+
+- `main` and `latest`: builds from the `main` branch.
+- `1.2.3`: a semantic version tag such as `v1.2.3`.
+- `sha-<short-commit>`: identifies the source commit.
+
+After configuring `config.toml` with `server.bind = "0.0.0.0:8080"` and exporting `TRANSCODER_API_TOKEN`, run a published image instead of building locally:
+
+```sh
+docker pull ghcr.io/swind/rust-ffmpeg-transcoder:latest
+docker run --rm --init --read-only --cap-drop ALL \
+  --security-opt no-new-privileges:true --pids-limit 256 --memory 2g --cpus 2 \
+  -p 127.0.0.1:8080:8080 -e TRANSCODER_API_TOKEN \
+  -v "$(pwd)/config.toml:/etc/transcoder/config.toml:ro" \
+  ghcr.io/swind/rust-ffmpeg-transcoder:latest
+```
+
+GHCR package visibility is separate from repository visibility. For anonymous pulls, make the package public in its GitHub package settings. For private packages, authenticate with `docker login ghcr.io` using credentials with package read access. Publishing an image does not deploy or restart an existing service.
+
 ### Optional AMD VAAPI
 
 On the actual GPU host, identify the render node and permissions; do not infer capabilities from a model name:
